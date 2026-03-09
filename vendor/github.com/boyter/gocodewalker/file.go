@@ -12,6 +12,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"regexp"
@@ -224,6 +225,49 @@ func (f *FileWalker) SetSkipHandler(handler func(path string, name string, isDir
 	}
 }
 
+// getGlobalGitIgnore loads the global gitignore file specified by
+// core.excludesFile in git config, or the default ~/.config/git/ignore.
+// Returns a slice with one GitIgnore entry, or an empty slice if not found.
+func getGlobalGitIgnore(baseDir string) []gitignore.GitIgnore {
+	// Try git config first
+	excludesFile := ""
+	if out, err := exec.Command("git", "config", "--global", "core.excludesFile").Output(); err == nil {
+		excludesFile = strings.TrimSpace(string(out))
+	}
+
+	// Expand ~ to home directory
+	if strings.HasPrefix(excludesFile, "~/") {
+		if home, err := os.UserHomeDir(); err == nil {
+			excludesFile = filepath.Join(home, excludesFile[2:])
+		}
+	}
+
+	// Fall back to XDG default
+	if excludesFile == "" {
+		if xdgConfig := os.Getenv("XDG_CONFIG_HOME"); xdgConfig != "" {
+			excludesFile = filepath.Join(xdgConfig, "git", "ignore")
+		} else if home, err := os.UserHomeDir(); err == nil {
+			excludesFile = filepath.Join(home, ".config", "git", "ignore")
+		}
+	}
+
+	if excludesFile == "" {
+		return nil
+	}
+
+	content, err := os.ReadFile(excludesFile)
+	if err != nil {
+		return nil
+	}
+
+	abs, err := filepath.Abs(baseDir)
+	if err != nil {
+		return nil
+	}
+
+	return []gitignore.GitIgnore{gitignore.New(bytes.NewReader(content), abs, nil)}
+}
+
 // Start will start walking the supplied directory with the supplied settings
 // and putting files that mach into the supplied channel.
 // Returns usual ioutil errors if there is a file issue
@@ -243,14 +287,22 @@ func (f *FileWalker) Start() error {
 		for _, directory := range f.directories {
 			d := directory // capture var
 			eg.Go(func() error {
-				return f.walkDirectoryRecursive(0, d, []gitignore.GitIgnore{}, []gitignore.GitIgnore{}, []gitignore.GitIgnore{}, []gitignore.GitIgnore{})
+				globalGitIgnores := []gitignore.GitIgnore{}
+				if !f.IgnoreGitIgnore {
+					globalGitIgnores = getGlobalGitIgnore(d)
+				}
+				return f.walkDirectoryRecursive(0, d, globalGitIgnores, []gitignore.GitIgnore{}, []gitignore.GitIgnore{}, []gitignore.GitIgnore{})
 			})
 		}
 
 		err = eg.Wait()
 	} else {
 		if f.directory != "" {
-			err = f.walkDirectoryRecursive(0, f.directory, []gitignore.GitIgnore{}, []gitignore.GitIgnore{}, []gitignore.GitIgnore{}, []gitignore.GitIgnore{})
+			globalGitIgnores := []gitignore.GitIgnore{}
+			if !f.IgnoreGitIgnore {
+				globalGitIgnores = getGlobalGitIgnore(f.directory)
+			}
+			err = f.walkDirectoryRecursive(0, f.directory, globalGitIgnores, []gitignore.GitIgnore{}, []gitignore.GitIgnore{}, []gitignore.GitIgnore{})
 		}
 	}
 
